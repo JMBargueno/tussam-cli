@@ -97,9 +97,9 @@ describe('CacheStore & cache paths', () => {
     await store.saveNetworkTopology(makeTopology(nowIso, 50, 100));
 
     // Only 10 lines (< 80% of 50) should be rejected unless force: true
-    await expect(
-      store.saveNetworkTopology(makeTopology(nowIso, 10, 100)),
-    ).rejects.toThrow(/Incomplete topology sync rejected/);
+    await expect(store.saveNetworkTopology(makeTopology(nowIso, 10, 100))).rejects.toThrow(
+      /Incomplete topology sync rejected/,
+    );
 
     // Force bypasses completeness guard
     await store.saveNetworkTopology(makeTopology(nowIso, 10, 100), { force: true });
@@ -112,7 +112,9 @@ describe('CacheStore & cache paths', () => {
     const nowIso = '2026-11-24T12:00:00.000Z';
     const store = new CacheStore({ cacheDir: dir, nowFn: () => Date.parse(nowIso) });
 
-    await store.saveStopIndex([{ code: '43', name: 'Recaredo', lat: 37.38, lon: -5.98, lines: [] }]);
+    await store.saveStopIndex([
+      { code: '43', name: 'Recaredo', lat: 37.38, lon: -5.98, lines: [] },
+    ]);
     await store.saveSchedule('2026-11-24', 1, '43', ['08:00:00', '08:15:00']);
 
     const status = await store.getStatus();

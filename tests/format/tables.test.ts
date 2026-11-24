@@ -1,16 +1,23 @@
 import { describe, expect, it } from 'vitest';
+import { stripAnsi } from '../../src/format/colors.js';
 import {
   formatAlerts,
   formatArrivalsTable,
+  formatFavoritesTable,
   formatLinesTable,
   formatNearbyTable,
   formatTimetable,
+  formatWalkSuggestion,
 } from '../../src/format/tables.js';
-import type { Journey, Line, NearbyStop, ServiceAlert, StopArrivalsResult } from '../../src/types.js';
-
-function stripAnsi(text: string): string {
-  return text.replace(/\u001b\[[0-9;]*m/g, '');
-}
+import type {
+  FavoriteStop,
+  Journey,
+  Line,
+  NearbyStop,
+  RouteWalkSuggestion,
+  ServiceAlert,
+  StopArrivalsResult,
+} from '../../src/types.js';
 
 describe('Table formatters', () => {
   it('renders TIMETABLE with direct and walking transfer rows', () => {
@@ -98,7 +105,9 @@ describe('Table formatters', () => {
     expect(output).toContain('C4 → 37');
     expect(output).toContain('~16:21');
     expect(output).toContain('walk 180m (3 min), arrive 16:02, depart 16:09 (00:07)');
-    expect(output).toContain('Showing 2 of 40 journeys. Pass --all to view the full day timetable.');
+    expect(output).toContain(
+      'Showing 2 of 40 journeys. Pass --all to view the full day timetable.',
+    );
   });
 
   it('renders live arrivals board with Now, line filtering, and stale notice', () => {
@@ -156,7 +165,9 @@ describe('Table formatters', () => {
         description: 'Circular Exterior 1',
         color: '#008431',
         isCircular: true,
-        directions: [{ direction: 99, destination: 'CIRCULAR', startTime: '06:00', endTime: '00:20' }],
+        directions: [
+          { direction: 99, destination: 'CIRCULAR', startTime: '06:00', endTime: '00:20' },
+        ],
       },
     ];
     expect(formatLinesTable(lines)).toContain('Circular');
@@ -185,5 +196,89 @@ describe('Table formatters', () => {
     ];
     expect(stripAnsi(formatAlerts(alerts))).toContain('[Lines: 06, C1] Detour active');
     expect(stripAnsi(formatAlerts([]))).toContain('No active TUSSAM service alerts.');
+  });
+
+  it('renders origin/destination walks, offline --estimate legend, favorites table, and walk tips', () => {
+    const walkedJourney: Journey = {
+      legs: [
+        {
+          lineId: 1,
+          lineLabel: '01',
+          lineColor: '#f54129',
+          direction: 1,
+          fromStopCode: '2',
+          fromStopName: 'Menéndez Pelayo',
+          toStopCode: '57',
+          toStopName: 'Manuel Siurot',
+          departureSeconds: 9 * 3600 + 2 * 60,
+          arrivalSeconds: 9 * 3600 + 16 * 60,
+          stopsCount: 9,
+          estimated: true,
+        },
+      ],
+      transfers: [],
+      originWalk: {
+        fromStopCode: '43',
+        fromStopName: 'Recaredo',
+        toStopCode: '2',
+        toStopName: 'Menéndez Pelayo',
+        walkMeters: 145,
+        walkSeconds: 121,
+      },
+      destinationWalk: {
+        fromStopCode: '57',
+        fromStopName: 'Manuel Siurot',
+        toStopCode: '58',
+        toStopName: 'Hospital V.Rocío',
+        walkMeters: 95,
+        walkSeconds: 80,
+      },
+      departureSeconds: 9 * 3600,
+      arrivalSeconds: 9 * 3600 + 17 * 60 + 20,
+      durationSeconds: 17 * 60 + 20,
+      transferCount: 0,
+      estimated: true,
+    };
+
+    const timetable = stripAnsi(formatTimetable([walkedJourney], { estimatedFallback: true }));
+    expect(timetable).toContain('Walk → 01 → Walk');
+    expect(timetable).toContain(
+      'Start walk: Recaredo (#43) → Menéndez Pelayo (#2): walk 145m (3 min), board 01 at 09:02',
+    );
+    expect(timetable).toContain(
+      'End walk: Manuel Siurot (#57) → Hospital V.Rocío (#58): alight at 09:16, walk 95m (2 min)',
+    );
+    expect(timetable).toContain('Offline estimates computed from ArcGIS network topology');
+
+    const emptyFavs = formatFavoritesTable([]);
+    expect(emptyFavs).toContain('tussam-cli fav add <alias> <stop>');
+
+    const favs: FavoriteStop[] = [
+      {
+        alias: 'casa',
+        stopCode: '43',
+        stopName: 'Recaredo (Puerta Carmona)',
+        addedAt: '2026-11-24T12:00:00.000Z',
+      },
+    ];
+    expect(stripAnsi(formatFavoritesTable(favs))).toContain('casa');
+    expect(stripAnsi(formatFavoritesTable(favs))).toContain('Recaredo (Puerta Carmona)');
+
+    const suggestion: RouteWalkSuggestion = {
+      type: 'origin',
+      walkMeters: 150,
+      walkSeconds: 125,
+      suggestedOriginStopCode: '2',
+      suggestedOriginStopName: 'Menéndez Pelayo',
+      lineLabels: ['01'],
+      estimatedDurationSeconds: 18 * 60,
+      baselineDurationSeconds: 36 * 60,
+      transfers: 0,
+      baselineTransfers: 1,
+    };
+    const tip = stripAnsi(formatWalkSuggestion(suggestion));
+    expect(tip).toContain('Walking 150m');
+    expect(tip).toContain('Menéndez Pelayo (#2)');
+    expect(tip).toContain('Line 01');
   });
 });

@@ -101,4 +101,19 @@ describe('scheduleMatcher', () => {
     expect(terminusDur).toBeGreaterThanOrEqual(200);
     expect(terminusDur).toBeLessThan(900);
   });
+
+  it('falls back to estimated arrivals on shared terminus mismatch only when fallbackOnEmptyMatch is true', () => {
+    const board = normalizeScheduleSeconds(['08:00:00', '08:15:00']);
+    const oppositeDirTimes = normalizeScheduleSeconds(['07:00:00', '07:10:00']);
+
+    expect(pairLegDepartures(board, oppositeDirTimes, 12 * 60)).toEqual([]);
+
+    const fallback = pairLegDepartures(board, oppositeDirTimes, 12 * 60, {
+      fallbackOnEmptyMatch: true,
+    });
+    expect(fallback).toEqual([
+      { departureSeconds: 8 * 3600, arrivalSeconds: 8 * 3600 + 720, estimated: true },
+      { departureSeconds: 8 * 3600 + 900, arrivalSeconds: 8 * 3600 + 1620, estimated: true },
+    ]);
+  });
 });

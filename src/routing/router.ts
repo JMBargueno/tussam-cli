@@ -1,36 +1,110 @@
-import { TussamClient } from '../api/client.js';
+import type { TussamClient } from '../api/client.js';
 import { TussamApiError } from '../api/errors.js';
-import { CacheStore } from '../cache/store.js';
+import type { CacheStore } from '../cache/store.js';
 import type {
   Journey,
   JourneyLeg,
   JourneyTransfer,
   NetworkTopology,
   RouteSearchOptions,
+  RouteSearchResult,
 } from '../types.js';
-import { formatDateKey, normalizeScheduleSeconds, withLocalTime } from '../utils/time.js';
-import { type CandidateCorridor, findCandidateCorridors } from './corridors.js';
+import {
+  formatDateKey,
+  isSameLocalDay,
+  normalizeScheduleSeconds,
+  withLocalTime,
+} from '../utils/time.js';
+import {
+  type CandidateCorridor,
+  findAlternativeWalkSuggestion,
+  findCandidateCorridors,
+} from './corridors.js';
 import { type PairedDeparture, pairLegDepartures } from './scheduleMatcher.js';
 import {
+  DEFAULT_DEST_WALK_METERS,
   DEFAULT_MAX_WALK_METERS,
+  DEFAULT_ORIGIN_WALK_METERS,
   DEFAULT_TRANSFER_PENALTY_SECONDS,
   MAX_JOURNEY_SECONDS,
   MAX_TRANSFER_WAIT_SECONDS,
+  WALK_ACCESS_PENALTY_SECONDS,
 } from './transfers.js';
 
 export type ScheduleLookup = (lineId: number, stopCode: string) => readonly number[];
 
 function journeyScore(journey: Journey): number {
-  return journey.durationSeconds + journey.transferCount * DEFAULT_TRANSFER_PENALTY_SECONDS;
+  return (
+    journey.durationSeconds +
+    journey.transferCount * DEFAULT_TRANSFER_PENALTY_SECONDS +
+    (journey.originWalk ? WALK_ACCESS_PENALTY_SECONDS : 0) +
+    (journey.destinationWalk ? WALK_ACCESS_PENALTY_SECONDS : 0)
+  );
 }
 
 function journeySignature(journey: Journey): string {
-  return journey.legs
+  const originPart = journey.originWalk
+    ? `OW:${journey.originWalk.fromStopCode}->${journey.originWalk.toStopCode}|`
+    : '';
+  const destPart = journey.destinationWalk
+    ? `|DW:${journey.destinationWalk.fromStopCode}->${journey.destinationWalk.toStopCode}`
+    : '';
+  const legsPart = journey.legs
     .map(
       (leg) =>
         `${leg.lineId}:${leg.direction}:${leg.fromStopCode}:${leg.departureSeconds}->${leg.toStopCode}:${leg.arrivalSeconds}`,
     )
     .join('|');
+  return originPart + legsPart + destPart;
+}
+
+function sortJourneys(journeys: Journey[], sortByDuration?: boolean): Journey[] {
+  if (sortByDuration) {
+    journeys.sort(
+      (a, b) =>
+        a.durationSeconds - b.durationSeconds ||
+        a.transferCount - b.transferCount ||
+        a.departureSeconds - b.departureSeconds,
+    );
+  } else {
+    journeys.sort(
+      (a, b) =>
+        a.departureSeconds - b.departureSeconds ||
+        a.arrivalSeconds - b.arrivalSeconds ||
+        a.transferCount - b.transferCount,
+    );
+  }
+  return journeys;
+}
+
+function finalizeJourneys(candidates: readonly Journey[], sortByDuration?: boolean): Journey[] {
+  // Retain the highest-scoring journey per exact departure time before Pareto dominance pruning
+  // (matches renfe-cli's per-departure selection so a transfer penalty protects direct rides).
+  const bestByDeparture = new Map<number, Journey>();
+  for (const candidate of candidates) {
+    const existing = bestByDeparture.get(candidate.departureSeconds);
+    if (
+      !existing ||
+      journeyScore(candidate) < journeyScore(existing) ||
+      (journeyScore(candidate) === journeyScore(existing) &&
+        (candidate.arrivalSeconds < existing.arrivalSeconds ||
+          (candidate.arrivalSeconds === existing.arrivalSeconds &&
+            candidate.transferCount < existing.transferCount)))
+    ) {
+      bestByDeparture.set(candidate.departureSeconds, candidate);
+    }
+  }
+
+  const allCandidates = Array.from(bestByDeparture.values());
+  allCandidates.sort(
+    (a, b) =>
+      a.departureSeconds - b.departureSeconds ||
+      journeyScore(a) - journeyScore(b) ||
+      a.arrivalSeconds - b.arrivalSeconds,
+  );
+
+  const pruned = removeDominated(allCandidates);
+  return sortJourneys(pruned, sortByDuration);
 }
 
 function findFirstDepartureAtOrAfter(
@@ -95,7 +169,7 @@ export function findJourneysFromCorridors(
   const pairedCache = new Map<string, PairedDeparture[]>();
 
   const getPairedForLeg = (leg: CandidateCorridor['legs'][number]): PairedDeparture[] => {
-    const cacheKey = `${leg.lineId}:${leg.direction}:${leg.boardStopCode}->${leg.alightStopCode}`;
+    const cacheKey = `${leg.lineId}:${leg.direction}:${leg.boardStopCode}->${leg.alightStopCode}:${leg.isTerminusAlight ? 1 : 0}`;
     const cached = pairedCache.get(cacheKey);
     if (cached) {
       return cached;
@@ -103,7 +177,9 @@ export function findJourneysFromCorridors(
 
     const boardTimes = scheduleLookup(leg.lineId, leg.boardStopCode);
     const alightTimes = scheduleLookup(leg.lineId, leg.alightStopCode);
-    const paired = pairLegDepartures(boardTimes, alightTimes, leg.estimatedDurationSeconds);
+    const paired = pairLegDepartures(boardTimes, alightTimes, leg.estimatedDurationSeconds, {
+      fallbackOnEmptyMatch: Boolean(leg.isTerminusAlight),
+    });
     pairedCache.set(cacheKey, paired);
     return paired;
   };
@@ -120,12 +196,13 @@ export function findJourneysFromCorridors(
       continue;
     }
 
+    const originWalkSeconds = corridor.originWalk?.walkSeconds ?? 0;
+    const destWalkSeconds = corridor.destinationWalk?.walkSeconds ?? 0;
     const firstLegList = legDepartures[0]!;
+
     for (const firstDep of firstLegList) {
-      if (
-        options.afterSeconds !== undefined &&
-        firstDep.departureSeconds < options.afterSeconds
-      ) {
+      const doorDepartureSeconds = firstDep.departureSeconds - originWalkSeconds;
+      if (options.afterSeconds !== undefined && doorDepartureSeconds < options.afterSeconds) {
         continue;
       }
 
@@ -201,8 +278,8 @@ export function findJourneysFromCorridors(
         continue;
       }
 
-      const departureSeconds = legs[0]!.departureSeconds;
-      const arrivalSeconds = legs[legs.length - 1]!.arrivalSeconds;
+      const departureSeconds = doorDepartureSeconds;
+      const arrivalSeconds = prevArrival + destWalkSeconds;
       const durationSeconds = arrivalSeconds - departureSeconds;
       if (durationSeconds <= 0 || durationSeconds > MAX_JOURNEY_SECONDS) {
         continue;
@@ -211,6 +288,30 @@ export function findJourneysFromCorridors(
       const journey: Journey = {
         legs,
         transfers,
+        ...(corridor.originWalk
+          ? {
+              originWalk: {
+                fromStopCode: corridor.originWalk.fromStopCode,
+                fromStopName: stopName(corridor.originWalk.fromStopCode),
+                toStopCode: corridor.originWalk.toStopCode,
+                toStopName: stopName(corridor.originWalk.toStopCode),
+                walkMeters: corridor.originWalk.walkMeters,
+                walkSeconds: corridor.originWalk.walkSeconds,
+              },
+            }
+          : {}),
+        ...(corridor.destinationWalk
+          ? {
+              destinationWalk: {
+                fromStopCode: corridor.destinationWalk.fromStopCode,
+                fromStopName: stopName(corridor.destinationWalk.fromStopCode),
+                toStopCode: corridor.destinationWalk.toStopCode,
+                toStopName: stopName(corridor.destinationWalk.toStopCode),
+                walkMeters: corridor.destinationWalk.walkMeters,
+                walkSeconds: corridor.destinationWalk.walkSeconds,
+              },
+            }
+          : {}),
         departureSeconds,
         arrivalSeconds,
         durationSeconds,
@@ -225,50 +326,466 @@ export function findJourneysFromCorridors(
     }
   }
 
-  // Retain the highest-scoring journey per exact departure time before Pareto dominance pruning
-  // (matches renfe-cli's per-departure selection so a transfer penalty protects direct rides).
-  const bestByDeparture = new Map<number, Journey>();
-  for (const candidate of candidatesBySignature.values()) {
-    const existing = bestByDeparture.get(candidate.departureSeconds);
-    if (
-      !existing ||
-      journeyScore(candidate) < journeyScore(existing) ||
-      (journeyScore(candidate) === journeyScore(existing) &&
-        (candidate.arrivalSeconds < existing.arrivalSeconds ||
-          (candidate.arrivalSeconds === existing.arrivalSeconds &&
-            candidate.transferCount < existing.transferCount)))
-    ) {
-      bestByDeparture.set(candidate.departureSeconds, candidate);
+  return finalizeJourneys(Array.from(candidatesBySignature.values()), options.sortByDuration);
+}
+
+/**
+ * Synthesizes offline estimated journeys directly from ArcGIS topology distances and speeds.
+ */
+export function buildEstimatedJourneysFromCorridors(
+  topology: NetworkTopology,
+  corridors: readonly CandidateCorridor[],
+  options: { anchorSeconds?: number; sortByDuration?: boolean } = {},
+): Journey[] {
+  const stopName = (code: string): string => topology.stops[code]?.name || code;
+  const anchorSeconds = Math.max(0, Math.round(options.anchorSeconds ?? 8 * 3_600));
+  const candidatesBySignature = new Map<string, Journey>();
+
+  for (const corridor of corridors) {
+    if (corridor.legs.length === 0) {
+      continue;
+    }
+
+    const originWalkSeconds = corridor.originWalk?.walkSeconds ?? 0;
+    const destWalkSeconds = corridor.destinationWalk?.walkSeconds ?? 0;
+    let cursor = anchorSeconds + originWalkSeconds;
+
+    const legs: JourneyLeg[] = [];
+    const transfers: JourneyTransfer[] = [];
+
+    for (let i = 0; i < corridor.legs.length; i++) {
+      const cLeg = corridor.legs[i]!;
+      if (i > 0) {
+        const cTransfer = corridor.transfers[i - 1]!;
+        const waitSeconds = cTransfer.minTransferSeconds + 180;
+        const dep = cursor + waitSeconds;
+        transfers.push({
+          fromStopCode: cTransfer.fromStopCode,
+          fromStopName: stopName(cTransfer.fromStopCode),
+          toStopCode: cTransfer.toStopCode,
+          toStopName: stopName(cTransfer.toStopCode),
+          walkMeters: cTransfer.walkMeters,
+          walkSeconds: cTransfer.walkSeconds,
+          arrivalSeconds: cursor,
+          departureSeconds: dep,
+          waitSeconds,
+        });
+        cursor = dep;
+      }
+
+      const legDep = cursor;
+      const legArr = legDep + Math.max(60, Math.round(cLeg.estimatedDurationSeconds));
+      legs.push({
+        lineId: cLeg.lineId,
+        lineLabel: cLeg.lineLabel,
+        lineColor: cLeg.lineColor,
+        direction: cLeg.direction,
+        fromStopCode: cLeg.boardStopCode,
+        fromStopName: stopName(cLeg.boardStopCode),
+        toStopCode: cLeg.alightStopCode,
+        toStopName: stopName(cLeg.alightStopCode),
+        departureSeconds: legDep,
+        arrivalSeconds: legArr,
+        stopsCount: cLeg.stopsCount,
+        estimated: true,
+      });
+      cursor = legArr;
+    }
+
+    const departureSeconds = anchorSeconds;
+    const arrivalSeconds = cursor + destWalkSeconds;
+    const durationSeconds = arrivalSeconds - departureSeconds;
+    if (durationSeconds <= 0 || durationSeconds > MAX_JOURNEY_SECONDS) {
+      continue;
+    }
+
+    const journey: Journey = {
+      legs,
+      transfers,
+      ...(corridor.originWalk
+        ? {
+            originWalk: {
+              fromStopCode: corridor.originWalk.fromStopCode,
+              fromStopName: stopName(corridor.originWalk.fromStopCode),
+              toStopCode: corridor.originWalk.toStopCode,
+              toStopName: stopName(corridor.originWalk.toStopCode),
+              walkMeters: corridor.originWalk.walkMeters,
+              walkSeconds: corridor.originWalk.walkSeconds,
+            },
+          }
+        : {}),
+      ...(corridor.destinationWalk
+        ? {
+            destinationWalk: {
+              fromStopCode: corridor.destinationWalk.fromStopCode,
+              fromStopName: stopName(corridor.destinationWalk.fromStopCode),
+              toStopCode: corridor.destinationWalk.toStopCode,
+              toStopName: stopName(corridor.destinationWalk.toStopCode),
+              walkMeters: corridor.destinationWalk.walkMeters,
+              walkSeconds: corridor.destinationWalk.walkSeconds,
+            },
+          }
+        : {}),
+      departureSeconds,
+      arrivalSeconds,
+      durationSeconds,
+      transferCount: transfers.length,
+      estimated: true,
+    };
+
+    const sig = journeySignature(journey);
+    if (!candidatesBySignature.has(sig)) {
+      candidatesBySignature.set(sig, journey);
     }
   }
 
-  const allCandidates = Array.from(bestByDeparture.values());
-  allCandidates.sort(
-    (a, b) =>
-      a.departureSeconds - b.departureSeconds ||
-      journeyScore(a) - journeyScore(b) ||
-      a.arrivalSeconds - b.arrivalSeconds,
+  return finalizeJourneys(Array.from(candidatesBySignature.values()), options.sortByDuration);
+}
+
+function splitIntoHydrationBatches(
+  corridors: readonly CandidateCorridor[],
+  firstBatchSize: number,
+): CandidateCorridor[][] {
+  if (corridors.length === 0) {
+    return [];
+  }
+  const batches: CandidateCorridor[][] = [];
+  const firstSize = Math.max(1, firstBatchSize);
+  batches.push(corridors.slice(0, firstSize));
+  for (let i = firstSize; i < corridors.length; i += 2) {
+    batches.push(corridors.slice(i, i + 2));
+  }
+  return batches;
+}
+
+async function sleepWithAbort(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) {
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    const onAbort = (): void => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort);
+      resolve();
+    }, ms);
+    signal.addEventListener('abort', onAbort, { once: true });
+  });
+}
+
+/**
+ * Runs Phase 1 corridor discovery, progressively hydrates missing stop schedules in bounded
+ * batches with an HTTP 429 circuit breaker, and computes Pareto-optimal timed journeys.
+ */
+export async function routeWithHydrationDetailed(
+  client: TussamClient,
+  cache: CacheStore,
+  topology: NetworkTopology,
+  options: RouteSearchOptions,
+): Promise<RouteSearchResult> {
+  const maxTransfers = options.maxTransfers ?? 2;
+  const maxWalkMeters = options.maxWalkMeters ?? DEFAULT_MAX_WALK_METERS;
+  const maxOriginWalkMeters = Math.max(
+    0,
+    options.maxOriginWalkMeters ?? DEFAULT_ORIGIN_WALK_METERS,
+  );
+  const maxDestWalkMeters = Math.max(0, options.maxDestWalkMeters ?? DEFAULT_DEST_WALK_METERS);
+
+  const corridors = findCandidateCorridors(topology, options.fromStopCode, options.toStopCode, {
+    maxTransfers,
+    maxWalkMeters,
+    maxOriginWalkMeters,
+    maxDestWalkMeters,
+    maxCorridors: 6,
+    includeNight: options.includeNight,
+  });
+
+  const walkSuggestion =
+    maxOriginWalkMeters === 0 || maxDestWalkMeters === 0
+      ? findAlternativeWalkSuggestion(
+          topology,
+          options.fromStopCode,
+          options.toStopCode,
+          corridors,
+          {
+            maxTransfers,
+            maxWalkMeters,
+            maxOriginWalkMeters,
+            maxDestWalkMeters,
+            maxCorridors: 6,
+            includeNight: options.includeNight,
+          },
+        )
+      : undefined;
+
+  if (corridors.length === 0) {
+    return {
+      journeys: [],
+      rateLimited: false,
+      partial: false,
+      estimatedFallback: Boolean(options.estimate),
+      hydratedCorridors: 0,
+      totalCorridors: 0,
+      warnings: [],
+      ...(walkSuggestion ? { walkSuggestion } : {}),
+    };
+  }
+
+  const now = new Date();
+  const baseDate = options.date ?? now;
+  const dateKey = formatDateKey(baseDate);
+  const queryDateTime = withLocalTime(baseDate, 12, 0, 0);
+
+  const normalizedSchedules = new Map<string, number[]>();
+  const hydratedKeys = new Set<string>();
+  const attemptedKeys = new Set<string>();
+
+  for (const corridor of corridors) {
+    for (const leg of corridor.legs) {
+      const endpoints = [
+        { lineId: leg.lineId, stopCode: leg.boardStopCode },
+        { lineId: leg.lineId, stopCode: leg.alightStopCode },
+      ];
+      for (const endpoint of endpoints) {
+        const key = `${endpoint.lineId}:${endpoint.stopCode}`;
+        if (normalizedSchedules.has(key)) {
+          continue;
+        }
+        const shouldUseCache = !options.refresh || Boolean(options.estimate);
+        const cached = shouldUseCache
+          ? await cache.getSchedule(dateKey, endpoint.lineId, endpoint.stopCode)
+          : null;
+        if (cached) {
+          normalizedSchedules.set(key, normalizeScheduleSeconds(cached));
+          hydratedKeys.add(key);
+          attemptedKeys.add(key);
+        }
+      }
+    }
+  }
+
+  const countHydratedCorridors = (): number =>
+    corridors.filter((corridor) =>
+      corridor.legs.every(
+        (leg) =>
+          hydratedKeys.has(`${leg.lineId}:${leg.boardStopCode}`) &&
+          hydratedKeys.has(`${leg.lineId}:${leg.alightStopCode}`),
+      ),
+    ).length;
+
+  if (options.estimate) {
+    const cachedCorridors = corridors.filter((corridor) =>
+      corridor.legs.every(
+        (leg) =>
+          hydratedKeys.has(`${leg.lineId}:${leg.boardStopCode}`) &&
+          hydratedKeys.has(`${leg.lineId}:${leg.alightStopCode}`),
+      ),
+    );
+    const timedJourneys =
+      cachedCorridors.length > 0
+        ? findJourneysFromCorridors(
+            topology,
+            cachedCorridors,
+            (lineId, stopCode) => normalizedSchedules.get(`${lineId}:${stopCode}`) ?? [],
+            {
+              sortByDuration: options.sortByDuration,
+              afterSeconds: options.afterSeconds,
+            },
+          )
+        : [];
+
+    const uncachedCorridors =
+      timedJourneys.length === 0
+        ? corridors
+        : corridors.filter((corridor) => !cachedCorridors.includes(corridor));
+
+    const defaultAnchor = isSameLocalDay(baseDate, now)
+      ? now.getHours() * 3600 + now.getMinutes() * 60
+      : 8 * 3600;
+    const anchorSeconds = options.afterSeconds ?? defaultAnchor;
+
+    const estJourneys =
+      uncachedCorridors.length > 0
+        ? buildEstimatedJourneysFromCorridors(topology, uncachedCorridors, {
+            anchorSeconds,
+            sortByDuration: options.sortByDuration,
+          })
+        : [];
+
+    const combined = sortJourneys(
+      removeDominated([...timedJourneys, ...estJourneys]),
+      options.sortByDuration,
+    );
+
+    return {
+      journeys: combined,
+      rateLimited: false,
+      partial: false,
+      estimatedFallback: true,
+      hydratedCorridors: cachedCorridors.length,
+      totalCorridors: corridors.length,
+      warnings: ['Showing offline topology-based route estimates (--estimate).'],
+      ...(walkSuggestion ? { walkSuggestion } : {}),
+    };
+  }
+
+  const firstBatchSize =
+    options.hydrationBatchSize ?? (corridors[0]?.transfers.length === 0 ? 3 : 2);
+  const batches = splitIntoHydrationBatches(corridors, firstBatchSize);
+  const requestDelayMs = Math.max(0, options.requestDelayMs ?? 120);
+
+  const abortController = new AbortController();
+  const state: {
+    circuitOpen: boolean;
+    rateLimitError: TussamApiError | null;
+    lastApiError: TussamApiError | null;
+    uncachedAttemptCount: number;
+    uncachedSuccessCount: number;
+  } = {
+    circuitOpen: false,
+    rateLimitError: null,
+    lastApiError: null,
+    uncachedAttemptCount: 0,
+    uncachedSuccessCount: 0,
+  };
+
+  for (const batch of batches) {
+    if (state.circuitOpen || abortController.signal.aborted) {
+      break;
+    }
+
+    const batchPending: Array<{ key: string; lineId: number; stopCode: string }> = [];
+    for (const corridor of batch) {
+      for (const leg of corridor.legs) {
+        const pair = [
+          { lineId: leg.lineId, stopCode: leg.boardStopCode },
+          { lineId: leg.lineId, stopCode: leg.alightStopCode },
+        ];
+        for (const endpoint of pair) {
+          const key = `${endpoint.lineId}:${endpoint.stopCode}`;
+          if (!attemptedKeys.has(key)) {
+            attemptedKeys.add(key);
+            batchPending.push({ key, lineId: endpoint.lineId, stopCode: endpoint.stopCode });
+          }
+        }
+      }
+    }
+
+    if (batchPending.length === 0) {
+      continue;
+    }
+
+    let cursor = 0;
+    const worker = async (): Promise<void> => {
+      while (
+        cursor < batchPending.length &&
+        !state.circuitOpen &&
+        !abortController.signal.aborted
+      ) {
+        const index = cursor;
+        cursor += 1;
+        const item = batchPending[index]!;
+        state.uncachedAttemptCount += 1;
+
+        try {
+          const line = topology.lines[String(item.lineId)];
+          const isNight = line ? /^A\d/i.test(line.label.trim()) : false;
+          const fetchTime = isNight ? withLocalTime(baseDate, 1, 30, 0) : queryDateTime;
+          const rawTimes = await client.fetchStopSchedule(item.stopCode, item.lineId, fetchTime, {
+            signal: abortController.signal,
+          });
+          await cache
+            .saveSchedule(dateKey, item.lineId, item.stopCode, rawTimes)
+            .catch(() => undefined);
+          normalizedSchedules.set(item.key, normalizeScheduleSeconds(rawTimes));
+          hydratedKeys.add(item.key);
+          state.uncachedSuccessCount += 1;
+        } catch (err) {
+          if (err instanceof TussamApiError && err.statusCode === 429) {
+            state.circuitOpen = true;
+            state.rateLimitError = err;
+            abortController.abort();
+            break;
+          }
+          if (err instanceof TussamApiError && !abortController.signal.aborted) {
+            state.lastApiError = err;
+          }
+          if (!normalizedSchedules.has(item.key)) {
+            normalizedSchedules.set(item.key, []);
+          }
+        }
+
+        if (
+          cursor < batchPending.length &&
+          !state.circuitOpen &&
+          !abortController.signal.aborted &&
+          requestDelayMs > 0
+        ) {
+          await sleepWithAbort(requestDelayMs, abortController.signal);
+        }
+      }
+    };
+
+    const workerCount = Math.min(2, batchPending.length);
+    await Promise.all(Array.from({ length: workerCount }, () => worker()));
+  }
+
+  const hydratedCorridors = countHydratedCorridors();
+  const journeys = findJourneysFromCorridors(
+    topology,
+    corridors,
+    (lineId, stopCode) => normalizedSchedules.get(`${lineId}:${stopCode}`) ?? [],
+    {
+      sortByDuration: options.sortByDuration,
+      afterSeconds: options.afterSeconds,
+    },
   );
 
-  const pruned = removeDominated(allCandidates);
+  if (state.circuitOpen) {
+    if (journeys.length > 0) {
+      return {
+        journeys,
+        rateLimited: true,
+        partial: true,
+        estimatedFallback: false,
+        hydratedCorridors,
+        totalCorridors: corridors.length,
+        warnings: [
+          `TUSSAM rate limit (HTTP 429) reached; showing partial results from ${hydratedCorridors}/${corridors.length} corridors. Pass --estimate for offline topology estimates.`,
+        ],
+        ...(walkSuggestion ? { walkSuggestion } : {}),
+      };
+    }
 
-  if (options.sortByDuration) {
-    pruned.sort(
-      (a, b) =>
-        a.durationSeconds - b.durationSeconds ||
-        a.transferCount - b.transferCount ||
-        a.departureSeconds - b.departureSeconds,
-    );
-  } else {
-    pruned.sort(
-      (a, b) =>
-        a.departureSeconds - b.departureSeconds ||
-        a.arrivalSeconds - b.arrivalSeconds ||
-        a.transferCount - b.transferCount,
+    throw new TussamApiError(
+      `${state.rateLimitError?.message ?? 'TUSSAM upstream rate-limited (HTTP 429)'}. Pass --estimate for offline topology estimates.`,
+      429,
+      state.rateLimitError?.url,
+      state.rateLimitError?.retryAfterMs,
     );
   }
 
-  return pruned;
+  if (
+    state.uncachedAttemptCount > 0 &&
+    state.uncachedSuccessCount === 0 &&
+    state.lastApiError &&
+    journeys.length === 0
+  ) {
+    throw state.lastApiError;
+  }
+
+  return {
+    journeys,
+    rateLimited: false,
+    partial: false,
+    estimatedFallback: false,
+    hydratedCorridors,
+    totalCorridors: corridors.length,
+    warnings: [],
+    ...(walkSuggestion ? { walkSuggestion } : {}),
+  };
 }
 
 /**
@@ -281,98 +798,6 @@ export async function routeWithHydration(
   topology: NetworkTopology,
   options: RouteSearchOptions,
 ): Promise<Journey[]> {
-  const corridors = findCandidateCorridors(topology, options.fromStopCode, options.toStopCode, {
-    maxTransfers: options.maxTransfers ?? 2,
-    maxWalkMeters: options.maxWalkMeters ?? DEFAULT_MAX_WALK_METERS,
-    maxCorridors: 6,
-    includeNight: options.includeNight,
-  });
-
-  if (corridors.length === 0) {
-    return [];
-  }
-
-  const baseDate = options.date ?? new Date();
-  const dateKey = formatDateKey(baseDate);
-  const queryDateTime = withLocalTime(baseDate, 12, 0, 0);
-
-  const scheduleEndpoints = new Map<string, { lineId: number; stopCode: string }>();
-  for (const corridor of corridors) {
-    for (const leg of corridor.legs) {
-      scheduleEndpoints.set(`${leg.lineId}:${leg.boardStopCode}`, {
-        lineId: leg.lineId,
-        stopCode: leg.boardStopCode,
-      });
-      scheduleEndpoints.set(`${leg.lineId}:${leg.alightStopCode}`, {
-        lineId: leg.lineId,
-        stopCode: leg.alightStopCode,
-      });
-    }
-  }
-
-  const normalizedSchedules = new Map<string, number[]>();
-  const pendingEndpoints: Array<{ key: string; lineId: number; stopCode: string }> = [];
-
-  for (const [key, endpoint] of scheduleEndpoints.entries()) {
-    const cached = options.refresh
-      ? null
-      : await cache.getSchedule(dateKey, endpoint.lineId, endpoint.stopCode);
-    if (cached) {
-      normalizedSchedules.set(key, normalizeScheduleSeconds(cached));
-    } else {
-      pendingEndpoints.push({ key, lineId: endpoint.lineId, stopCode: endpoint.stopCode });
-    }
-  }
-
-  if (pendingEndpoints.length > 0) {
-    let uncachedAttemptCount = 0;
-    let uncachedSuccessCount = 0;
-    let lastApiError: TussamApiError | null = null;
-    let cursor = 0;
-
-    const worker = async (): Promise<void> => {
-      while (cursor < pendingEndpoints.length) {
-        const index = cursor;
-        cursor += 1;
-        const item = pendingEndpoints[index]!;
-        uncachedAttemptCount += 1;
-
-        try {
-          const line = topology.lines[String(item.lineId)];
-          const isNight = line ? /^A\d/i.test(line.label.trim()) : false;
-          const fetchTime = isNight ? withLocalTime(baseDate, 1, 30, 0) : queryDateTime;
-          const rawTimes = await client.fetchStopSchedule(item.stopCode, item.lineId, fetchTime);
-          await cache.saveSchedule(dateKey, item.lineId, item.stopCode, rawTimes);
-          normalizedSchedules.set(item.key, normalizeScheduleSeconds(rawTimes));
-          uncachedSuccessCount += 1;
-        } catch (err) {
-          if (err instanceof TussamApiError) {
-            lastApiError = err;
-          }
-          normalizedSchedules.set(item.key, []);
-        }
-
-        if (cursor < pendingEndpoints.length) {
-          await new Promise((resolve) => setTimeout(resolve, 120));
-        }
-      }
-    };
-
-    const workerCount = Math.min(2, pendingEndpoints.length);
-    await Promise.all(Array.from({ length: workerCount }, () => worker()));
-
-    if (uncachedAttemptCount > 0 && uncachedSuccessCount === 0 && lastApiError) {
-      throw lastApiError;
-    }
-  }
-
-  return findJourneysFromCorridors(
-    topology,
-    corridors,
-    (lineId, stopCode) => normalizedSchedules.get(`${lineId}:${stopCode}`) ?? [],
-    {
-      sortByDuration: options.sortByDuration,
-      afterSeconds: options.afterSeconds,
-    },
-  );
+  const result = await routeWithHydrationDetailed(client, cache, topology, options);
+  return result.journeys;
 }

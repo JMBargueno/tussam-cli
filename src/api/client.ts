@@ -103,6 +103,7 @@ export interface TussamClientOptions {
   maxRetries?: number;
   timeoutMs?: number;
   retryBaseDelayMs?: number;
+  maxRetryWaitMs?: number;
 }
 
 class AsyncSemaphore {
@@ -144,6 +145,34 @@ class AsyncSemaphore {
 
 function defaultSleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Parses an HTTP `Retry-After` header value (integer seconds or HTTP-date) into milliseconds.
+ */
+export function parseRetryAfterMs(
+  headerValue: string | null,
+  nowMs: number = Date.now(),
+): number | null {
+  if (!headerValue) {
+    return null;
+  }
+  const trimmed = headerValue.trim();
+  if (!trimmed) {
+    return null;
+  }
+  if (/^\d+$/.test(trimmed)) {
+    const seconds = Number.parseInt(trimmed, 10);
+    return Number.isFinite(seconds) ? seconds * 1_000 : null;
+  }
+  if (!/[a-zA-Z]/.test(trimmed)) {
+    return null;
+  }
+  const parsedDateMs = Date.parse(trimmed);
+  if (!Number.isFinite(parsedDateMs)) {
+    return null;
+  }
+  return Math.max(0, parsedDateMs - nowMs);
 }
 
 /**
@@ -222,19 +251,23 @@ export class TussamClient {
   readonly baseUrl: string;
   readonly fetchImpl: typeof fetch;
   private readonly sleepImpl: (ms: number) => Promise<void>;
+  private readonly hasCustomSleep: boolean;
   private readonly semaphore: AsyncSemaphore;
   private readonly maxRetries: number;
   private readonly timeoutMs: number;
   private readonly retryBaseDelayMs: number;
+  readonly maxRetryWaitMs: number;
 
   constructor(options: TussamClientOptions = {}) {
     this.baseUrl = (options.baseUrl ?? DEFAULT_BASE_URL).replace(/\/+$/, '');
     this.fetchImpl = options.fetchImpl ?? globalThis.fetch.bind(globalThis);
+    this.hasCustomSleep = Boolean(options.sleepImpl);
     this.sleepImpl = options.sleepImpl ?? defaultSleep;
     this.semaphore = new AsyncSemaphore(Math.max(1, options.maxConcurrency ?? 2));
     this.maxRetries = Math.max(0, options.maxRetries ?? 3);
     this.timeoutMs = Math.max(500, options.timeoutMs ?? 20_000);
     this.retryBaseDelayMs = Math.max(1, options.retryBaseDelayMs ?? 1_000);
+    this.maxRetryWaitMs = Math.max(0, options.maxRetryWaitMs ?? 10_000);
   }
 
   private buildHeaders(accept: string): Record<string, string> {
@@ -245,36 +278,92 @@ export class TussamClient {
     };
   }
 
-  private computeRetryWaitMs(response: Response, attempt: number): number {
-    const retryAfter = response.headers.get('Retry-After');
-    if (retryAfter) {
-      const parsedSeconds = Number.parseInt(retryAfter.trim(), 10);
-      if (Number.isFinite(parsedSeconds) && String(parsedSeconds) === retryAfter.trim()) {
-        const clampedSeconds = Math.max(1, Math.min(60, parsedSeconds));
-        return clampedSeconds * 1_000;
-      }
+  private async sleepAbortable(ms: number, signal?: AbortSignal, url?: string): Promise<void> {
+    if (signal?.aborted) {
+      throw new TussamApiError(`Request aborted (${url ?? this.baseUrl})`, undefined, url);
     }
-    return this.retryBaseDelayMs * 2 ** attempt;
+    if (ms <= 0) {
+      return;
+    }
+    if (!signal) {
+      await this.sleepImpl(ms);
+      return;
+    }
+
+    if (!this.hasCustomSleep) {
+      await new Promise<void>((resolve, reject) => {
+        const onAbort = (): void => {
+          clearTimeout(timer);
+          reject(new TussamApiError(`Request aborted (${url ?? this.baseUrl})`, undefined, url));
+        };
+        const timer = setTimeout(() => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        }, ms);
+        signal.addEventListener('abort', onAbort, { once: true });
+      });
+      return;
+    }
+
+    await new Promise<void>((resolve, reject) => {
+      const onAbort = (): void => {
+        reject(new TussamApiError(`Request aborted (${url ?? this.baseUrl})`, undefined, url));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      this.sleepImpl(ms).then(
+        () => {
+          signal.removeEventListener('abort', onAbort);
+          resolve();
+        },
+        (err) => {
+          signal.removeEventListener('abort', onAbort);
+          reject(err);
+        },
+      );
+    });
   }
 
-  private async requestText(url: string, accept: string): Promise<{ status: number; text: string }> {
+  private async requestText(
+    url: string,
+    accept: string,
+    signal?: AbortSignal,
+  ): Promise<{ status: number; text: string }> {
     let lastError: unknown;
+    let totalWaitMs = 0;
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
+      if (signal?.aborted) {
+        throw new TussamApiError(`Request aborted (${url})`, undefined, url);
+      }
+
       let response: Response;
       try {
-        response = await this.semaphore.run(() =>
-          this.fetchImpl(url, {
+        const timeoutSignal = AbortSignal.timeout(this.timeoutMs);
+        const combinedSignal = signal ? AbortSignal.any([timeoutSignal, signal]) : timeoutSignal;
+
+        response = await this.semaphore.run(async () => {
+          if (signal?.aborted) {
+            throw new TussamApiError(`Request aborted (${url})`, undefined, url);
+          }
+          return this.fetchImpl(url, {
             method: 'GET',
             headers: this.buildHeaders(accept),
             redirect: 'error',
-            signal: AbortSignal.timeout(this.timeoutMs),
-          }),
-        );
+            signal: combinedSignal,
+          });
+        });
       } catch (err) {
         lastError = err;
-        if (attempt < this.maxRetries) {
-          await this.sleepImpl(this.retryBaseDelayMs * 2 ** attempt);
+        if (signal?.aborted) {
+          throw err instanceof TussamApiError
+            ? err
+            : new TussamApiError(`Request aborted (${url})`, undefined, url);
+        }
+        const remainingBudget = this.maxRetryWaitMs - totalWaitMs;
+        if (attempt < this.maxRetries && remainingBudget > 0) {
+          const waitMs = Math.min(this.retryBaseDelayMs * 2 ** attempt, remainingBudget);
+          await this.sleepAbortable(waitMs, signal, url);
+          totalWaitMs += waitMs;
           continue;
         }
         throw new TussamApiError(
@@ -285,19 +374,50 @@ export class TussamClient {
       }
 
       if (RETRYABLE_STATUS_CODES.has(response.status)) {
-        if (attempt < this.maxRetries) {
-          const waitMs = this.computeRetryWaitMs(response, attempt);
-          await this.sleepImpl(waitMs);
-          continue;
+        const retryAfterMs = parseRetryAfterMs(response.headers.get('Retry-After'));
+        const remainingBudget = this.maxRetryWaitMs - totalWaitMs;
+        await response.body?.cancel().catch(() => undefined);
+
+        if (attempt >= this.maxRetries || remainingBudget <= 0) {
+          throw new TussamApiError(
+            `TUSSAM upstream returned HTTP ${response.status} after ${attempt + 1} attempts`,
+            response.status,
+            url,
+            retryAfterMs ?? undefined,
+          );
         }
-        throw new TussamApiError(
-          `TUSSAM upstream returned HTTP ${response.status} after ${this.maxRetries + 1} attempts`,
-          response.status,
-          url,
-        );
+
+        if (response.status === 429 && retryAfterMs !== null && retryAfterMs > remainingBudget) {
+          throw new TussamApiError(
+            `TUSSAM upstream rate-limited (HTTP 429; Retry-After ${Math.ceil(retryAfterMs / 1_000)}s exceeds maxRetryWaitMs ${this.maxRetryWaitMs}ms)`,
+            429,
+            url,
+            retryAfterMs,
+          );
+        }
+
+        const rawWaitMs =
+          retryAfterMs !== null
+            ? Math.max(1_000, retryAfterMs)
+            : this.retryBaseDelayMs * 2 ** attempt;
+        const waitMs = Math.min(rawWaitMs, remainingBudget);
+
+        if (waitMs <= 0) {
+          throw new TussamApiError(
+            `TUSSAM upstream returned HTTP ${response.status}`,
+            response.status,
+            url,
+            retryAfterMs ?? undefined,
+          );
+        }
+
+        await this.sleepAbortable(waitMs, signal, url);
+        totalWaitMs += waitMs;
+        continue;
       }
 
       if (!response.ok) {
+        await response.body?.cancel().catch(() => undefined);
         throw new TussamApiError(
           `TUSSAM upstream returned HTTP ${response.status}`,
           response.status,
@@ -316,9 +436,9 @@ export class TussamClient {
     );
   }
 
-  private async requestJsonEnvelope<T>(path: string): Promise<T> {
+  private async requestJsonEnvelope<T>(path: string, signal?: AbortSignal): Promise<T> {
     const url = `${this.baseUrl}${path}`;
-    const { status, text } = await this.requestText(url, 'application/json');
+    const { status, text } = await this.requestText(url, 'application/json', signal);
     const trimmed = text.trimStart();
 
     if (trimmed.startsWith('<')) {
@@ -463,6 +583,7 @@ export class TussamClient {
     stopCode: string,
     lineId: number,
     dateTime: Date = new Date(),
+    options: { signal?: AbortSignal } = {},
   ): Promise<string[]> {
     const cleanCode = stopCode.trim();
     if (!cleanCode) {
@@ -472,6 +593,7 @@ export class TussamClient {
     const fh = formatTussamDateTime(dateTime);
     const result = await this.requestJsonEnvelope<{ horarios?: unknown }>(
       `/API/infotus-ui/horarios/${encodeURIComponent(cleanCode)}/${lineId}/${fh}`,
+      options.signal,
     );
 
     if (!result || !Array.isArray(result.horarios)) {
@@ -500,10 +622,7 @@ export class TussamClient {
       normalized = rawResult;
     }
 
-    const coords = coordsFromE6(
-      normalized.posicion?.latitudE6,
-      normalized.posicion?.longitudE6,
-    );
+    const coords = coordsFromE6(normalized.posicion?.latitudE6, normalized.posicion?.longitudE6);
     const arrivals: StopArrival[] = [];
 
     for (const line of normalized.lineasCoincidentes ?? []) {
@@ -512,7 +631,11 @@ export class TussamClient {
       const color = line.color ?? '#000000';
 
       for (const est of line.estimaciones ?? []) {
-        if (typeof est.segundos !== 'number' || !Number.isFinite(est.segundos) || est.segundos < 0) {
+        if (
+          typeof est.segundos !== 'number' ||
+          !Number.isFinite(est.segundos) ||
+          est.segundos < 0
+        ) {
           continue;
         }
         arrivals.push({
@@ -551,7 +674,9 @@ export class TussamClient {
       throw new TussamValidationError(`Invalid latitude '${lat}'. Expected a number in [-90, 90].`);
     }
     if (!Number.isFinite(lon) || lon < -180 || lon > 180) {
-      throw new TussamValidationError(`Invalid longitude '${lon}'. Expected a number in [-180, 180].`);
+      throw new TussamValidationError(
+        `Invalid longitude '${lon}'. Expected a number in [-180, 180].`,
+      );
     }
 
     const { latE6, lonE6 } = coordsToE6(lat, lon);
@@ -593,7 +718,9 @@ export class TussamClient {
       });
     }
 
-    return stops.sort((a, b) => a.distanceMeters - b.distanceMeters || a.code.localeCompare(b.code));
+    return stops.sort(
+      (a, b) => a.distanceMeters - b.distanceMeters || a.code.localeCompare(b.code),
+    );
   }
 
   async fetchActiveAlerts(): Promise<ServiceAlert[]> {

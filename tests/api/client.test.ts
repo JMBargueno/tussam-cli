@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { TussamClient, extractArrayParadasJson } from '../../src/api/client.js';
+import { TussamClient, extractArrayParadasJson, parseRetryAfterMs } from '../../src/api/client.js';
 import { TussamApiError } from '../../src/api/errors.js';
 
 function makeResponse(
@@ -149,9 +149,19 @@ describe('TussamClient', () => {
                     labelLinea: '01',
                     color: '#f54129',
                     estimaciones: [
-                      { vehiculo: 1062, destino: { texto: 'POLIGONO NORTE' }, distancia: 1205, segundos: 487 },
+                      {
+                        vehiculo: 1062,
+                        destino: { texto: 'POLIGONO NORTE' },
+                        distancia: 1205,
+                        segundos: 487,
+                      },
                       { vehiculo: 9999, destino: { texto: 'INVALID' }, distancia: 100 },
-                      { vehiculo: 8888, destino: { texto: 'NEGATIVE' }, distancia: 100, segundos: -30 },
+                      {
+                        vehiculo: 8888,
+                        destino: { texto: 'NEGATIVE' },
+                        distancia: 100,
+                        segundos: -30,
+                      },
                     ],
                   },
                   {
@@ -159,7 +169,12 @@ describe('TussamClient', () => {
                     labelLinea: 'C4',
                     color: '#008431',
                     estimaciones: [
-                      { vehiculo: 243, destino: { texto: 'PLAZA DE ARMAS' }, distancia: 39, segundos: 24 },
+                      {
+                        vehiculo: 243,
+                        destino: { texto: 'PLAZA DE ARMAS' },
+                        distancia: 39,
+                        segundos: 24,
+                      },
                     ],
                   },
                 ],
@@ -228,7 +243,10 @@ describe('TussamClient', () => {
       fetchImpl: async () => {
         attempt += 1;
         if (attempt === 1) {
-          return makeResponse('Too Many Requests', { status: 429, headers: { 'Retry-After': '3' } });
+          return makeResponse('Too Many Requests', {
+            status: 429,
+            headers: { 'Retry-After': '3' },
+          });
         }
         if (attempt === 2) {
           return makeResponse('Service Unavailable', { status: 503 });
@@ -245,7 +263,8 @@ describe('TussamClient', () => {
   it('rejects Cloudflare HTML challenges and upstream API error payloads', async () => {
     const htmlClient = new TussamClient({
       maxRetries: 0,
-      fetchImpl: async () => makeResponse('<!DOCTYPE html><html><body>Just a moment...</body></html>'),
+      fetchImpl: async () =>
+        makeResponse('<!DOCTYPE html><html><body>Just a moment...</body></html>'),
     });
     await expect(htmlClient.fetchActiveAlerts()).rejects.toThrow(/HTML\/challenge/);
 
@@ -262,5 +281,86 @@ describe('TussamClient', () => {
         ),
     });
     await expect(errClient.fetchActiveAlerts()).rejects.toThrow(/Peticion incorrecta/);
+  });
+
+  it('parses Retry-After seconds and HTTP-date values safely', () => {
+    const now = Date.parse('2026-11-24T12:00:00.000Z');
+    expect(parseRetryAfterMs('3', now)).toBe(3_000);
+    expect(parseRetryAfterMs('0', now)).toBe(0);
+    expect(parseRetryAfterMs('Tue, 24 Nov 2026 12:00:05 GMT', now)).toBe(5_000);
+    expect(parseRetryAfterMs('Tue, 24 Nov 2026 11:59:50 GMT', now)).toBe(0);
+    expect(parseRetryAfterMs('-2', now)).toBeNull();
+    expect(parseRetryAfterMs('3.5', now)).toBeNull();
+    expect(parseRetryAfterMs(null, now)).toBeNull();
+  });
+
+  it('caps cumulative retry waits to maxRetryWaitMs', async () => {
+    const sleepCalls: number[] = [];
+    const client = new TussamClient({
+      maxRetries: 4,
+      retryBaseDelayMs: 100,
+      maxRetryWaitMs: 150,
+      sleepImpl: async (ms) => {
+        sleepCalls.push(ms);
+      },
+      fetchImpl: async () => makeResponse('Service Unavailable', { status: 503 }),
+    });
+
+    await expect(client.fetchActiveAlerts()).rejects.toMatchObject({
+      name: 'TussamApiError',
+      statusCode: 503,
+    });
+    expect(sleepCalls).toEqual([100, 50]);
+  });
+
+  it('fails fast on HTTP 429 when Retry-After exceeds maxRetryWaitMs', async () => {
+    const sleepCalls: number[] = [];
+    let fetchCount = 0;
+    const client = new TussamClient({
+      maxRetries: 3,
+      maxRetryWaitMs: 500,
+      sleepImpl: async (ms) => {
+        sleepCalls.push(ms);
+      },
+      fetchImpl: async () => {
+        fetchCount += 1;
+        return makeResponse('Too Many Requests', { status: 429, headers: { 'Retry-After': '30' } });
+      },
+    });
+
+    await expect(
+      client.fetchStopSchedule('43', 1, new Date(2026, 10, 24, 12, 0, 0)),
+    ).rejects.toMatchObject({
+      name: 'TussamApiError',
+      statusCode: 429,
+      retryAfterMs: 30_000,
+    });
+    expect(fetchCount).toBe(1);
+    expect(sleepCalls).toEqual([]);
+  });
+
+  it('aborts retry sleep immediately when AbortSignal fires', async () => {
+    const controller = new AbortController();
+    let fetchCount = 0;
+    const client = new TussamClient({
+      maxRetries: 3,
+      retryBaseDelayMs: 500,
+      maxRetryWaitMs: 5_000,
+      sleepImpl: async () => {
+        controller.abort();
+        await new Promise((resolve) => setTimeout(resolve, 1_000));
+      },
+      fetchImpl: async () => {
+        fetchCount += 1;
+        return makeResponse('Service Unavailable', { status: 503 });
+      },
+    });
+
+    await expect(
+      client.fetchStopSchedule('43', 1, new Date(2026, 10, 24, 12, 0, 0), {
+        signal: controller.signal,
+      }),
+    ).rejects.toThrow(/aborted/i);
+    expect(fetchCount).toBe(1);
   });
 });

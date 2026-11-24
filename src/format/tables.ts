@@ -2,13 +2,16 @@ import pc from 'picocolors';
 import type { LineRoute } from '../tussam.js';
 import type {
   CacheStatus,
+  FavoriteStop,
   Journey,
   Line,
   NearbyStop,
+  RouteWalkSuggestion,
   ServiceAlert,
   StopArrivalsResult,
 } from '../types.js';
 import { formatDurationHHMM, formatSecondsToHHMM } from '../utils/time.js';
+import { colorizeLineLabel, padRightVisible } from './colors.js';
 
 function padRight(value: string, width: number): string {
   return value.length >= width ? value : value + ' '.repeat(width - value.length);
@@ -31,6 +34,7 @@ function centerText(value: string, width: number): string {
 export interface TimetableFormatOptions {
   totalCount?: number;
   limited?: boolean;
+  estimatedFallback?: boolean;
 }
 
 export function formatTimetable(
@@ -41,8 +45,21 @@ export function formatTimetable(
     return '\nNo schedules available for this route.';
   }
 
-  const linesLabels = journeys.map((j) => j.legs.map((l) => l.lineLabel).join(' → '));
-  const linesWidth = Math.max(22, ...linesLabels.map((s) => s.length));
+  const plainLinesLabels = journeys.map((j) =>
+    [
+      ...(j.originWalk ? ['Walk'] : []),
+      ...j.legs.map((l) => l.lineLabel),
+      ...(j.destinationWalk ? ['Walk'] : []),
+    ].join(' → '),
+  );
+  const coloredLinesLabels = journeys.map((j) =>
+    [
+      ...(j.originWalk ? ['Walk'] : []),
+      ...j.legs.map((l) => colorizeLineLabel(l.lineLabel, l.lineColor)),
+      ...(j.destinationWalk ? ['Walk'] : []),
+    ].join(' → '),
+  );
+  const linesWidth = Math.max(22, ...plainLinesLabels.map((s) => s.length));
   const totalWidth = 2 + linesWidth + 3 + 9 + 3 + 7 + 3 + 8 + 3 + 9;
   const eqBar = '='.repeat(Math.max(73, totalWidth));
   const dashBar = '-'.repeat(Math.max(73, totalWidth));
@@ -61,15 +78,26 @@ export function formatTimetable(
 
   journeys.forEach((journey, index) => {
     out.push(dashBar);
-    const linesText = linesLabels[index]!;
+    const linesDisplay = padRightVisible(coloredLinesLabels[index]!, linesWidth);
     const depText = formatSecondsToHHMM(journey.departureSeconds);
     const arrText = `${journey.estimated ? '~' : ''}${formatSecondsToHHMM(journey.arrivalSeconds)}`;
     const durText = `${journey.estimated ? '~' : ''}${formatDurationHHMM(journey.durationSeconds)}`;
     const trText = String(journey.transferCount);
 
     out.push(
-      `  ${pc.cyan(padRight(linesText, linesWidth))} | ${centerText(depText, 9)} | ${centerText(arrText, 7)} | ${centerText(durText, 8)} | ${centerText(trText, 9)}`,
+      `  ${linesDisplay} | ${centerText(depText, 9)} | ${centerText(arrText, 7)} | ${centerText(durText, 8)} | ${centerText(trText, 9)}`,
     );
+
+    if (journey.originWalk) {
+      const w = journey.originWalk;
+      const walkMin = Math.max(1, Math.ceil(w.walkSeconds / 60));
+      const firstLeg = journey.legs[0]!;
+      out.push(
+        pc.dim(
+          `      Start walk: ${w.fromStopName} (#${w.fromStopCode}) → ${w.toStopName} (#${w.toStopCode}): walk ${w.walkMeters}m (${walkMin} min), board ${firstLeg.lineLabel} at ${formatSecondsToHHMM(firstLeg.departureSeconds)}`,
+        ),
+      );
+    }
 
     journey.transfers.forEach((transfer, trIdx) => {
       const arr = formatSecondsToHHMM(transfer.arrivalSeconds);
@@ -90,11 +118,28 @@ export function formatTimetable(
         );
       }
     });
+
+    if (journey.destinationWalk) {
+      const w = journey.destinationWalk;
+      const walkMin = Math.max(1, Math.ceil(w.walkSeconds / 60));
+      const lastLeg = journey.legs[journey.legs.length - 1]!;
+      out.push(
+        pc.dim(
+          `      End walk: ${w.fromStopName} (#${w.fromStopCode}) → ${w.toStopName} (#${w.toStopCode}): alight at ${formatSecondsToHHMM(lastLeg.arrivalSeconds)}, walk ${w.walkMeters}m (${walkMin} min)`,
+        ),
+      );
+    }
   });
 
   out.push(pc.bold(eqBar));
 
-  if (journeys.some((j) => j.estimated)) {
+  if (options.estimatedFallback) {
+    out.push(
+      pc.dim(
+        '~ Offline estimates computed from ArcGIS network topology (live schedules not queried).',
+      ),
+    );
+  } else if (journeys.some((j) => j.estimated)) {
     out.push(pc.dim('~ Estimated arrival time interpolated from route distance.'));
   }
 
@@ -152,9 +197,10 @@ export function formatArrivalsTable(result: StopArrivalsResult, filterLine?: str
     const dist =
       arrival.distanceMeters !== null ? `${arrival.distanceMeters.toLocaleString('en-US')} m` : '-';
     const veh = arrival.vehicle !== null ? `#${arrival.vehicle}` : '-';
+    const lineCell = padRightVisible(colorizeLineLabel(arrival.lineLabel, arrival.color), 6);
 
     out.push(
-      `  ${pc.cyan(padRight(arrival.lineLabel, 6))} | ${padRight(arrival.destination, destWidth)} | ${etaPadded} | ${padLeft(dist, 9)} | ${padLeft(veh, 8)}`,
+      `  ${lineCell} | ${padRight(arrival.destination, destWidth)} | ${etaPadded} | ${padLeft(dist, 9)} | ${padLeft(veh, 8)}`,
     );
   }
   out.push(bar);
@@ -165,7 +211,7 @@ export function formatArrivalsTable(result: StopArrivalsResult, filterLine?: str
 export function formatStopScheduleTable(
   stopCode: string,
   stopName: string,
-  entries: Array<{ lineLabel: string; times: string[] }>,
+  entries: Array<{ lineLabel: string; lineColor?: string; times: string[] }>,
   dateLabel: string,
 ): string {
   const title = stopName ? `Stop #${stopCode} — ${stopName}` : `Stop #${stopCode}`;
@@ -173,7 +219,14 @@ export function formatStopScheduleTable(
 
   for (const entry of entries) {
     out.push('');
-    out.push(pc.cyan(pc.bold(`Line ${entry.lineLabel} (${entry.times.length} departures)`)));
+    out.push(
+      pc.bold(
+        colorizeLineLabel(
+          `Line ${entry.lineLabel} (${entry.times.length} departures)`,
+          entry.lineColor,
+        ),
+      ),
+    );
     if (entry.times.length === 0) {
       out.push('  No scheduled passing times.');
       continue;
@@ -207,11 +260,10 @@ export function formatLinesTable(lines: readonly Line[]): string {
     const type = line.isCircular ? 'Circular' : 'Bidirectional';
     const firstDir = line.directions[0];
     const hours =
-      firstDir && firstDir.startTime && firstDir.endTime
-        ? `${firstDir.startTime}-${firstDir.endTime}`
-        : '-';
+      firstDir?.startTime && firstDir.endTime ? `${firstDir.startTime}-${firstDir.endTime}` : '-';
+    const lineCell = padRightVisible(colorizeLineLabel(line.label, line.color), 6);
     out.push(
-      `  ${pc.cyan(padRight(line.label, 6))} | ${padRight(type, 13)} | ${padRight(hours, 13)} | ${line.description}`,
+      `  ${lineCell} | ${padRight(type, 13)} | ${padRight(hours, 13)} | ${line.description}`,
     );
   }
   out.push(bar);
@@ -224,7 +276,12 @@ export function formatLineRoute(
   route: LineRoute,
   directionFilter: '1' | '2' | 'both' = 'both',
 ): string {
-  const out: string[] = ['', pc.bold(`Line ${route.line.label} — ${route.line.description}`)];
+  const out: string[] = [
+    '',
+    pc.bold(
+      `${colorizeLineLabel(`Line ${route.line.label}`, route.line.color)} — ${route.line.description}`,
+    ),
+  ];
 
   const selectedDirections = route.directions.filter((d) => {
     if (directionFilter === 'both') {
@@ -245,7 +302,14 @@ export function formatLineRoute(
     const hours =
       dir.info.startTime && dir.info.endTime ? ` (${dir.info.startTime}–${dir.info.endTime})` : '';
     out.push('');
-    out.push(pc.cyan(pc.bold(`Direction ${dir.info.direction}: ${dir.info.destination}${hours}`)));
+    out.push(
+      pc.bold(
+        colorizeLineLabel(
+          `Direction ${dir.info.direction}: ${dir.info.destination}${hours}`,
+          route.line.color,
+        ),
+      ),
+    );
 
     const nameWidth = Math.max(24, ...dir.stops.map((s) => s.name.length));
     const bar = '-'.repeat(6 + 3 + nameWidth + 3 + 8 + 3 + 11 + 3 + 15);
@@ -285,7 +349,7 @@ export function formatNearbyTable(stops: readonly NearbyStop[]): string {
 
   for (const stop of stops) {
     const dist = `${stop.distanceMeters} m`;
-    const lines = stop.lines.map((l) => l.label).join(', ');
+    const lines = stop.lines.map((l) => colorizeLineLabel(l.label, l.color)).join(', ');
     out.push(
       `  ${pc.cyan(padRight(stop.code, 6))} | ${padLeft(dist, 8)} | ${padRight(stop.name, nameWidth)} | ${lines}`,
     );
@@ -293,7 +357,10 @@ export function formatNearbyTable(stops: readonly NearbyStop[]): string {
     if (stop.arrivals && stop.arrivals.arrivals.length > 0) {
       const top = stop.arrivals.arrivals
         .slice(0, 3)
-        .map((a) => `${a.lineLabel}: ${a.seconds < 60 ? 'Now' : `${a.minutes}m`}`)
+        .map(
+          (a) =>
+            `${colorizeLineLabel(a.lineLabel, a.color)}: ${a.seconds < 60 ? 'Now' : `${a.minutes}m`}`,
+        )
         .join(' · ');
       out.push(pc.dim(`      Next: ${top}`));
     }
@@ -332,4 +399,58 @@ export function formatCacheStatus(status: CacheStatus): string {
     `  Arrivals:    ${status.arrivalsCount} cached files`,
     `  Total size:  ${sizeKb} KB`,
   ].join('\n');
+}
+
+export function formatFavoritesTable(favorites: readonly FavoriteStop[]): string {
+  if (favorites.length === 0) {
+    return '\nNo favorite stops saved. Add one with: tussam-cli fav add <alias> <stop>';
+  }
+
+  const aliasWidth = Math.max(10, ...favorites.map((f) => f.alias.length));
+  const nameWidth = Math.max(20, ...favorites.map((f) => f.stopName.length));
+  const bar = '-'.repeat(2 + aliasWidth + 3 + 6 + 3 + nameWidth + 2);
+
+  const out: string[] = [
+    '',
+    bar,
+    `  ${padRight('Alias', aliasWidth)} | ${padRight('Code', 6)} | ${padRight('Stop Name', nameWidth)}`,
+    bar,
+  ];
+
+  for (const fav of favorites) {
+    out.push(
+      `  ${pc.cyan(padRight(fav.alias, aliasWidth))} | ${padRight(fav.stopCode, 6)} | ${fav.stopName}`,
+    );
+  }
+  out.push(bar);
+
+  return out.join('\n');
+}
+
+export function formatWalkSuggestion(suggestion: RouteWalkSuggestion): string {
+  const walkMin = Math.max(1, Math.ceil(suggestion.walkSeconds / 60));
+  const durMin = Math.max(1, Math.round(suggestion.estimatedDurationSeconds / 60));
+  const routeDesc = `${suggestion.lineLabels.join(' → ')} (~${durMin} min, ${suggestion.transfers} transfer${suggestion.transfers === 1 ? '' : 's'})`;
+
+  if (suggestion.type === 'origin' && suggestion.suggestedOriginStopCode) {
+    return pc.yellow(
+      `Tip: Walking ${suggestion.walkMeters}m (~${walkMin} min) to ${suggestion.suggestedOriginStopName ?? suggestion.suggestedOriginStopCode} (#${suggestion.suggestedOriginStopCode}) offers Line ${routeDesc}.`,
+    );
+  }
+  if (suggestion.type === 'destination' && suggestion.suggestedDestStopCode) {
+    return pc.yellow(
+      `Tip: Alighting at ${suggestion.suggestedDestStopName ?? suggestion.suggestedDestStopCode} (#${suggestion.suggestedDestStopCode}) and walking ${suggestion.walkMeters}m (~${walkMin} min) offers Line ${routeDesc}.`,
+    );
+  }
+  const originPart = suggestion.suggestedOriginStopCode
+    ? `to ${suggestion.suggestedOriginStopName ?? suggestion.suggestedOriginStopCode} (#${suggestion.suggestedOriginStopCode})`
+    : '';
+  const destPart = suggestion.suggestedDestStopCode
+    ? `and alighting at ${suggestion.suggestedDestStopName ?? suggestion.suggestedDestStopCode} (#${suggestion.suggestedDestStopCode})`
+    : '';
+  const prefix =
+    `Tip: Walking ${suggestion.walkMeters}m (~${walkMin} min) ${originPart} ${destPart}`
+      .replace(/\s+/g, ' ')
+      .trim();
+  return pc.yellow(`${prefix} offers Line ${routeDesc}.`);
 }

@@ -8,12 +8,14 @@ export class TussamError extends Error {
 export class TussamApiError extends TussamError {
   readonly statusCode?: number;
   readonly url?: string;
+  readonly retryAfterMs?: number;
 
-  constructor(message: string, statusCode?: number, url?: string) {
+  constructor(message: string, statusCode?: number, url?: string, retryAfterMs?: number) {
     super(message);
     this.name = 'TussamApiError';
     this.statusCode = statusCode;
     this.url = url;
+    this.retryAfterMs = retryAfterMs;
   }
 }
 

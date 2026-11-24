@@ -1,3 +1,4 @@
+import type { Dirent } from 'node:fs';
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import { TussamApiError } from '../api/errors.js';
@@ -115,7 +116,7 @@ export class CacheStore {
 
   async getNetworkTopology(requireNight = false): Promise<NetworkTopology | null> {
     const topology = await this.readJson<NetworkTopology>(this.topologyPath);
-    if (!topology || topology.schemaVersion !== 1) {
+    if (topology?.schemaVersion !== 1) {
       return null;
     }
     if (!this.isWithinTtl(topology.syncedAt, TOPOLOGY_TTL_MS)) {
@@ -216,7 +217,7 @@ export class CacheStore {
   }
 
   private async countFilesAndBytes(dirPath: string): Promise<{ count: number; bytes: number }> {
-    let entries;
+    let entries: Dirent[];
     try {
       entries = await fs.readdir(dirPath, { withFileTypes: true });
     } catch {

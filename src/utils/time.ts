@@ -46,10 +46,14 @@ export function resolveQueryDate(
   const year = params.year ?? now.getFullYear();
 
   if (!Number.isInteger(year) || year < 1970 || year > 2100) {
-    throw new TussamValidationError(`Invalid year '${year}'. Expected an integer between 1970 and 2100.`);
+    throw new TussamValidationError(
+      `Invalid year '${year}'. Expected an integer between 1970 and 2100.`,
+    );
   }
   if (!Number.isInteger(month) || month < 1 || month > 12) {
-    throw new TussamValidationError(`Invalid month '${month}'. Expected an integer between 1 and 12.`);
+    throw new TussamValidationError(
+      `Invalid month '${month}'. Expected an integer between 1 and 12.`,
+    );
   }
   if (!Number.isInteger(day) || day < 1 || day > 31) {
     throw new TussamValidationError(`Invalid day '${day}'. Expected an integer between 1 and 31.`);
@@ -70,7 +74,9 @@ export function resolveQueryDate(
     resolved.getMonth() !== month - 1 ||
     resolved.getDate() !== day
   ) {
-    throw new TussamValidationError(`Provided date '${year}-${pad2(month)}-${pad2(day)}' does not exist.`);
+    throw new TussamValidationError(
+      `Provided date '${year}-${pad2(month)}-${pad2(day)}' does not exist.`,
+    );
   }
 
   return resolved;
@@ -112,7 +118,9 @@ export function parseAfterOption(hhmm: string): number {
   const hours = Number(match[1]);
   const minutes = Number(match[2]);
   if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
-    throw new TussamValidationError(`Invalid time '${hhmm}'. Hours must be 00-23 and minutes 00-59.`);
+    throw new TussamValidationError(
+      `Invalid time '${hhmm}'. Hours must be 00-23 and minutes 00-59.`,
+    );
   }
   return hours * 3600 + minutes * 60;
 }

@@ -2,16 +2,16 @@ import { TussamClient, type TussamClientOptions } from './api/client.js';
 import { TussamApiError, TussamValidationError } from './api/errors.js';
 import { CacheStore } from './cache/store.js';
 import { syncNetworkTopology } from './cache/sync.js';
-import { routeWithHydration } from './routing/router.js';
+import { routeWithHydrationDetailed } from './routing/router.js';
 import type {
   CacheStatus,
-  Journey,
   Line,
   LineDirectionInfo,
   LineStop,
   NearbyStop,
   NetworkTopology,
   RouteSearchOptions,
+  RouteSearchResult,
   ServiceAlert,
   Stop,
   StopArrivalsResult,
@@ -74,7 +74,9 @@ export class Tussam {
     this.cache = options.cache ?? new CacheStore(options.cacheDir);
   }
 
-  private async ensureTopology(options: { refresh?: boolean; onProgress?: SyncProgressCallback } = {}): Promise<NetworkTopology> {
+  private async ensureTopology(
+    options: { refresh?: boolean; onProgress?: SyncProgressCallback } = {},
+  ): Promise<NetworkTopology> {
     if (!options.refresh) {
       const cached = await this.cache.getNetworkTopology(false);
       if (cached) {
@@ -275,7 +277,9 @@ export class Tussam {
       throw new TussamValidationError(`Invalid latitude '${lat}'. Expected a number in [-90, 90].`);
     }
     if (!Number.isFinite(lon) || lon < -180 || lon > 180) {
-      throw new TussamValidationError(`Invalid longitude '${lon}'. Expected a number in [-180, 180].`);
+      throw new TussamValidationError(
+        `Invalid longitude '${lon}'. Expected a number in [-180, 180].`,
+      );
     }
 
     const radius = Math.max(0, options.radius ?? 500);
@@ -341,7 +345,7 @@ export class Tussam {
 
   async findSchedules(
     options: RouteSearchOptions & { onSyncProgress?: SyncProgressCallback },
-  ): Promise<{ journeys: Journey[]; topologySynced: boolean }> {
+  ): Promise<RouteSearchResult & { topologySynced: boolean }> {
     let topology = options.refresh
       ? null
       : await this.cache.getNetworkTopology(Boolean(options.includeNight));
@@ -357,16 +361,18 @@ export class Tussam {
       topologySynced = true;
     }
 
-    const journeys = await routeWithHydration(this.client, this.cache, topology, options);
-    return { journeys, topologySynced };
+    const result = await routeWithHydrationDetailed(this.client, this.cache, topology, options);
+    return { ...result, topologySynced };
   }
 
-  async syncCache(options: {
-    date?: Date;
-    includeNight?: boolean;
-    force?: boolean;
-    onProgress?: SyncProgressCallback;
-  } = {}): Promise<NetworkTopology> {
+  async syncCache(
+    options: {
+      date?: Date;
+      includeNight?: boolean;
+      force?: boolean;
+      onProgress?: SyncProgressCallback;
+    } = {},
+  ): Promise<NetworkTopology> {
     return syncNetworkTopology(this.client, this.cache, options);
   }
 

@@ -1,7 +1,7 @@
 import { fetchArcGisTopology } from '../api/arcgis.js';
-import { TussamClient } from '../api/client.js';
+import type { TussamClient } from '../api/client.js';
 import type { NetworkTopology, Stop, SyncProgressCallback } from '../types.js';
-import { CacheStore } from './store.js';
+import type { CacheStore } from './store.js';
 
 export interface SyncTopologyOptions {
   date?: Date;

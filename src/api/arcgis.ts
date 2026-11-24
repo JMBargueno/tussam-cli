@@ -1,4 +1,3 @@
-import { TussamApiError } from './errors.js';
 import type {
   Line,
   LineDirectionInfo,
@@ -8,6 +7,8 @@ import type {
   StopLineRef,
   SyncProgressCallback,
 } from '../types.js';
+import { haversineMeters } from '../utils/geo.js';
+import { TussamApiError } from './errors.js';
 
 export const ARCGIS_LINES_URL =
   'https://services1.arcgis.com/hcmP7kr0Cx3AcTJk/arcgis/rest/services/TUSSAM_Lineas/FeatureServer/0/query?where=1%3D1&outFields=Linea,LabelLinea,Sublinea,Ruta,NombreLinea,NombreRuta,DestinoRuta,Color,Package&returnGeometry=false&f=json';
@@ -58,8 +59,7 @@ export interface ArcGisTopologyOptions {
 export function cleanArcGisStopName(rawName: string): { name: string; icons: string[] } {
   const icons = new Set<string>();
   const tagRegex = /\[([RCM])\]/gi;
-  let match: RegExpExecArray | null;
-  while ((match = tagRegex.exec(rawName)) !== null) {
+  for (const match of rawName.matchAll(tagRegex)) {
     const code = match[1]?.toUpperCase();
     if (code === 'R') {
       icons.add('renfe');
@@ -125,11 +125,7 @@ async function fetchArcGisJson<TAttrs>(
   }
 
   if (!response.ok) {
-    throw new TussamApiError(
-      `ArcGIS returned HTTP ${response.status}`,
-      response.status,
-      url,
-    );
+    throw new TussamApiError(`ArcGIS returned HTTP ${response.status}`, response.status, url);
   }
 
   const payload = (await response.json()) as ArcGisQueryResponse<TAttrs>;
@@ -153,6 +149,87 @@ function deduplicateConsecutiveStops(stops: readonly LineStop[]): LineStop[] {
     result.push(stop);
   }
   return result;
+}
+
+interface SortedRutaEntry {
+  ruta: number;
+  stops: LineStop[];
+}
+
+function buildSortedRutas(rutaMap: Map<number, LineStop[]>): SortedRutaEntry[] {
+  return Array.from(rutaMap.entries())
+    .sort(([rA], [rB]) => rA - rB)
+    .map(([ruta, stops]) => ({
+      ruta,
+      stops: deduplicateConsecutiveStops(
+        [...stops].sort((a, b) => a.distanceMeters - b.distanceMeters),
+      ),
+    }))
+    .filter((entry) => entry.stops.length >= 2);
+}
+
+function selectBestRutaForParity(
+  rutas: readonly SortedRutaEntry[],
+  isOdd: boolean,
+): SortedRutaEntry | undefined {
+  const matching = rutas.filter((r) => (isOdd ? r.ruta % 2 === 1 : r.ruta % 2 === 0));
+  if (matching.length === 0) {
+    return undefined;
+  }
+  return [...matching].sort((a, b) => b.stops.length - a.stops.length || a.ruta - b.ruta)[0];
+}
+
+function selectPrimarySublinea(
+  lineId: number,
+  subMap: Map<number, Map<number, LineStop[]>>,
+): { sublinea: number; sortedRutas: SortedRutaEntry[] } | null {
+  interface SublineaCandidate {
+    sublinea: number;
+    sortedRutas: SortedRutaEntry[];
+    hasBothDirections: boolean;
+    totalStops: number;
+    isCanonical: boolean;
+  }
+
+  const candidates: SublineaCandidate[] = [];
+  for (const [sublinea, rutaMap] of subMap.entries()) {
+    const sortedRutas = buildSortedRutas(rutaMap);
+    if (sortedRutas.length === 0) {
+      continue;
+    }
+    const bestOdd = selectBestRutaForParity(sortedRutas, true);
+    const bestEven = selectBestRutaForParity(sortedRutas, false);
+    const hasBothDirections = Boolean(bestOdd && bestEven);
+    const totalStops = (bestOdd?.stops.length ?? 0) + (bestEven?.stops.length ?? 0);
+    const isCanonical = sublinea === lineId * 100 + 10 || sublinea % 100 === 10;
+    candidates.push({
+      sublinea,
+      sortedRutas,
+      hasBothDirections,
+      totalStops,
+      isCanonical,
+    });
+  }
+
+  if (candidates.length === 0) {
+    return null;
+  }
+
+  candidates.sort((a, b) => {
+    if (a.hasBothDirections !== b.hasBothDirections) {
+      return a.hasBothDirections ? -1 : 1;
+    }
+    if (a.totalStops !== b.totalStops) {
+      return b.totalStops - a.totalStops;
+    }
+    if (a.isCanonical !== b.isCanonical) {
+      return a.isCanonical ? -1 : 1;
+    }
+    return a.sublinea - b.sublinea;
+  });
+
+  const best = candidates[0]!;
+  return { sublinea: best.sublinea, sortedRutas: best.sortedRutas };
 }
 
 export async function fetchArcGisTopology(
@@ -200,11 +277,7 @@ export async function fetchArcGisTopology(
       `&returnGeometry=true&outSR=4326&orderByFields=ObjectId` +
       `&resultRecordCount=${PAGE_SIZE}&resultOffset=${offset}&f=json`;
 
-    const stopPayload = await fetchArcGisJson<ArcGisStopAttributes>(
-      stopUrl,
-      fetchImpl,
-      timeoutMs,
-    );
+    const stopPayload = await fetchArcGisJson<ArcGisStopAttributes>(stopUrl, fetchImpl, timeoutMs);
     options.onProgress?.(Math.min(3, 1 + pageNum), 3, `ArcGIS stops page ${pageNum}`);
 
     const features = stopPayload.features ?? [];
@@ -294,7 +367,11 @@ export async function fetchArcGisTopology(
       if (!existingStop.name && name) {
         existingStop.name = name;
       }
-      if ((existingStop.lat === null || existingStop.lon === null) && feat.lat !== null && feat.lon !== null) {
+      if (
+        (existingStop.lat === null || existingStop.lon === null) &&
+        feat.lat !== null &&
+        feat.lon !== null
+      ) {
         existingStop.lat = feat.lat;
         existingStop.lon = feat.lon;
       }
@@ -341,11 +418,11 @@ export async function fetchArcGisTopology(
   const lineStopsRecord: Record<string, LineStop[]> = {};
 
   for (const [lineId, subMap] of stopsByLineSubRuta.entries()) {
-    const primarySublinea = Math.min(...Array.from(subMap.keys()));
-    const rutaMap = subMap.get(primarySublinea);
-    if (!rutaMap || rutaMap.size === 0) {
+    const primary = selectPrimarySublinea(lineId, subMap);
+    if (!primary) {
       continue;
     }
+    const { sublinea: primarySublinea, sortedRutas } = primary;
 
     const lineMetas = (lineMetaById.get(lineId) ?? []).filter(
       (m) => m.Sublinea === undefined || m.Sublinea === primarySublinea,
@@ -355,45 +432,69 @@ export async function fetchArcGisTopology(
     const description = cleanArcGisLineDescription(metaAny?.NombreLinea ?? '');
     const color = metaAny?.Color ?? '#000000';
 
-    const sortedRutas = Array.from(rutaMap.entries())
-      .sort(([rA], [rB]) => rA - rB)
-      .map(([ruta, stops]) => ({
-        ruta,
-        stops: deduplicateConsecutiveStops(
-          [...stops].sort((a, b) => a.distanceMeters - b.distanceMeters),
-        ),
-      }))
-      .filter((entry) => entry.stops.length >= 2);
-
-    if (sortedRutas.length === 0) {
-      continue;
-    }
-
-    const oddHalf = sortedRutas.find((r) => r.ruta % 2 === 1);
-    const evenHalf = sortedRutas.find((r) => r.ruta % 2 === 0);
-    const closesLoop =
-      Boolean(oddHalf && evenHalf) &&
-      oddHalf!.stops[oddHalf!.stops.length - 1]!.code === evenHalf!.stops[0]!.code &&
-      evenHalf!.stops[evenHalf!.stops.length - 1]!.code === oddHalf!.stops[0]!.code;
-    const isCircular = /^C\d/i.test(label) || /circular/i.test(description) || closesLoop;
+    const oddHalf = selectBestRutaForParity(sortedRutas, true);
+    const evenHalf = selectBestRutaForParity(sortedRutas, false);
+    const singleLoopRuta =
+      sortedRutas.length === 1 &&
+      sortedRutas[0]!.stops.length >= 4 &&
+      sortedRutas[0]!.stops[0]!.code ===
+        sortedRutas[0]!.stops[sortedRutas[0]!.stops.length - 1]!.code;
+    const isCircular = /^C\d/i.test(label) || /\bcircular\b/i.test(description) || singleLoopRuta;
 
     if (isCircular) {
       let loopStops: LineStop[];
       if (oddHalf && evenHalf) {
-        const lastDist = oddHalf.stops[oddHalf.stops.length - 1]!.distanceMeters;
-        const secondTrimmed =
-          evenHalf.stops[evenHalf.stops.length - 1]!.code === oddHalf.stops[0]!.code
-            ? evenHalf.stops.slice(1, -1)
-            : evenHalf.stops.slice(1);
+        const lastOddStop = oddHalf.stops[oddHalf.stops.length - 1]!;
+        const firstEvenStop = evenHalf.stops[0]!;
+        const sharesHandover = firstEvenStop.code === lastOddStop.code;
+        const sharesOrigin =
+          evenHalf.stops[evenHalf.stops.length - 1]!.code === oddHalf.stops[0]!.code;
+
+        const secondTrimmed = evenHalf.stops.slice(
+          sharesHandover ? 1 : 0,
+          sharesOrigin ? -1 : undefined,
+        );
+
+        let handoverOffset = lastOddStop.distanceMeters;
+        if (!sharesHandover && secondTrimmed.length > 0) {
+          let gapMeters = 150;
+          if (
+            lastOddStop.lat !== null &&
+            lastOddStop.lon !== null &&
+            firstEvenStop.lat !== null &&
+            firstEvenStop.lon !== null
+          ) {
+            const computed = Math.round(
+              haversineMeters(
+                lastOddStop.lat,
+                lastOddStop.lon,
+                firstEvenStop.lat,
+                firstEvenStop.lon,
+              ),
+            );
+            if (Number.isFinite(computed) && computed > 0) {
+              gapMeters = computed;
+            }
+          }
+          handoverOffset = lastOddStop.distanceMeters + gapMeters - firstEvenStop.distanceMeters;
+        }
+
         loopStops = [
           ...oddHalf.stops,
           ...secondTrimmed.map((s) => ({
             ...s,
-            distanceMeters: lastDist + s.distanceMeters,
+            distanceMeters: Math.max(
+              lastOddStop.distanceMeters + 1,
+              handoverOffset + s.distanceMeters,
+            ),
           })),
         ];
       } else {
-        loopStops = sortedRutas[0]!.stops;
+        const single = sortedRutas[0]!.stops;
+        loopStops =
+          single.length >= 2 && single[single.length - 1]!.code === single[0]!.code
+            ? single.slice(0, -1)
+            : single;
       }
 
       lineStopsRecord[`${lineId}:99`] = loopStops;
@@ -415,7 +516,10 @@ export async function fetchArcGisTopology(
       };
     } else {
       const directions: LineDirectionInfo[] = [];
-      for (const { ruta, stops } of sortedRutas) {
+      const selectedDirs = [oddHalf, evenHalf].filter((entry): entry is SortedRutaEntry =>
+        Boolean(entry),
+      );
+      for (const { ruta, stops } of selectedDirs) {
         const direction = ruta % 2 === 1 ? 1 : 2;
         if (lineStopsRecord[`${lineId}:${direction}`]) {
           continue;
@@ -423,9 +527,7 @@ export async function fetchArcGisTopology(
         lineStopsRecord[`${lineId}:${direction}`] = stops;
 
         const dirMeta = lineMetas.find((m) => m.Ruta === ruta);
-        const dest = cleanArcGisDestination(
-          dirMeta?.DestinoRuta || dirMeta?.NombreRuta || '',
-        );
+        const dest = cleanArcGisDestination(dirMeta?.DestinoRuta || dirMeta?.NombreRuta || '');
         directions.push({
           direction,
           destination: dest,

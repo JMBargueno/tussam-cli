@@ -125,14 +125,51 @@ export interface JourneyTransfer {
   waitSeconds: number;
 }
 
+export interface JourneyAccessWalk {
+  fromStopCode: string;
+  fromStopName: string;
+  toStopCode: string;
+  toStopName: string;
+  walkMeters: number;
+  walkSeconds: number;
+}
+
 export interface Journey {
   legs: JourneyLeg[];
   transfers: JourneyTransfer[];
+  originWalk?: JourneyAccessWalk;
+  destinationWalk?: JourneyAccessWalk;
   departureSeconds: number;
   arrivalSeconds: number;
   durationSeconds: number;
   transferCount: number;
   estimated: boolean;
+}
+
+export interface RouteWalkSuggestion {
+  type: 'origin' | 'destination' | 'both';
+  walkMeters: number;
+  walkSeconds: number;
+  suggestedOriginStopCode?: string;
+  suggestedOriginStopName?: string;
+  suggestedDestStopCode?: string;
+  suggestedDestStopName?: string;
+  lineLabels: string[];
+  estimatedDurationSeconds: number;
+  baselineDurationSeconds: number | null;
+  transfers: number;
+  baselineTransfers: number | null;
+}
+
+export interface RouteSearchResult {
+  journeys: Journey[];
+  rateLimited: boolean;
+  partial: boolean;
+  estimatedFallback: boolean;
+  hydratedCorridors: number;
+  totalCorridors: number;
+  warnings: string[];
+  walkSuggestion?: RouteWalkSuggestion;
 }
 
 export interface RouteSearchOptions {
@@ -143,8 +180,20 @@ export interface RouteSearchOptions {
   afterSeconds?: number;
   maxTransfers?: number;
   maxWalkMeters?: number;
+  maxOriginWalkMeters?: number;
+  maxDestWalkMeters?: number;
   includeNight?: boolean;
   refresh?: boolean;
+  estimate?: boolean;
+  hydrationBatchSize?: number;
+  requestDelayMs?: number;
+}
+
+export interface FavoriteStop {
+  alias: string;
+  stopCode: string;
+  stopName: string;
+  addedAt: string;
 }
 
 export interface CacheStatus {

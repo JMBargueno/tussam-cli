@@ -108,8 +108,15 @@ export function estimateLegDurationSeconds(
   }
 
   const avgSpeed = estimateAverageLineSpeed(stops);
-  if (deltaDistance === 0 && boardStop.lat !== null && boardStop.lon !== null && alightStop.lat !== null && alightStop.lon !== null) {
-    deltaDistance = haversineMeters(boardStop.lat, boardStop.lon, alightStop.lat, alightStop.lon) * 1.25;
+  if (
+    deltaDistance === 0 &&
+    boardStop.lat !== null &&
+    boardStop.lon !== null &&
+    alightStop.lat !== null &&
+    alightStop.lon !== null
+  ) {
+    deltaDistance =
+      haversineMeters(boardStop.lat, boardStop.lon, alightStop.lat, alightStop.lon) * 1.25;
   }
   return Math.max(60, Math.round(deltaDistance / avgSpeed));
 }
@@ -125,6 +132,7 @@ export function pairLegDepartures(
   boardTimesSec: readonly number[],
   alightTimesSec: readonly number[],
   expectedDurationSec: number,
+  options: { fallbackOnEmptyMatch?: boolean } = {},
 ): PairedDeparture[] {
   if (boardTimesSec.length === 0) {
     return [];
@@ -140,10 +148,7 @@ export function pairLegDepartures(
     }));
   }
 
-  const minTravel = Math.max(
-    30,
-    Math.round(Math.min(safeExpected * 0.5, safeExpected - 180)),
-  );
+  const minTravel = Math.max(30, Math.round(Math.min(safeExpected * 0.5, safeExpected - 180)));
   const maxTravel = Math.max(Math.round(safeExpected * 1.85), safeExpected + 600);
 
   const m = boardTimesSec.length;
@@ -209,5 +214,12 @@ export function pairLegDepartures(
   }
 
   paired.reverse();
+  if (paired.length === 0 && options.fallbackOnEmptyMatch) {
+    return boardTimesSec.map((dep) => ({
+      departureSeconds: dep,
+      arrivalSeconds: dep + safeExpected,
+      estimated: true,
+    }));
+  }
   return paired;
 }
